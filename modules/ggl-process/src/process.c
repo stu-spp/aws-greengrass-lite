@@ -4,9 +4,12 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <gg/cleanup.h>
 #include <gg/error.h>
+#include <gg/file.h>
 #include <gg/log.h>
+#include <gg/types.h>
 #include <ggl/process.h>
 #include <limits.h>
 #include <pthread.h>
@@ -47,52 +50,112 @@ static int sys_close_range(unsigned first, unsigned last, unsigned flags) {
     return (int) syscall(SYS_close_range, first, last, flags);
 }
 #else
+
+#define CLOSE_RANGE_UNSHARE 2
+
 static int sys_close_range(unsigned first, unsigned last, unsigned flags) {
-    (void) flags;
-    int max_fd = (int) sysconf(_SC_OPEN_MAX);
+    if (flags & CLOSE_RANGE_UNSHARE) {
+        unshare(CLONE_FILES);
+    }
+    int max_fd = (int) sysconf(_SC_OPEN_MAX) - 1;
     int range_last = (last < (unsigned) max_fd) ? (int) last : max_fd;
-    for (int i = (int) first; i < range_last; i++) {
+    for (int i = (int) first; i <= range_last; i++) {
         close(i);
     }
     return 0;
 }
 
-#define CLOSE_RANGE_UNSHARE 2
 #endif
 
-GgError ggl_process_spawn(const char *const argv[], int *handle) {
+void ggl_close_fds_from(unsigned int first) {
+    sys_close_range(first, UINT_MAX, CLOSE_RANGE_UNSHARE);
+}
+
+GgError ggl_process_spawn(
+    const char *const argv[],
+    const GglProcessSpawnConfig *config,
+    GglProcessHandle handle[static 1]
+) {
     assert(argv[0] != NULL);
-    assert(handle != NULL);
+
+    GglProcessSpawnConfig cfg = { 0 };
+    if (config != NULL) {
+        cfg = *config;
+    }
+
+    int err_pipe[2];
+    if (pipe2(err_pipe, O_CLOEXEC) < 0) {
+        GG_LOGE("Err %d when calling pipe2.", errno);
+        return GG_ERR_FATAL;
+    }
+    GG_CLEANUP(cleanup_close, err_pipe[0])
 
     pid_t pid = fork();
 
     if (pid == 0) {
-        sys_close_range(3, UINT_MAX, CLOSE_RANGE_UNSHARE);
+        if (cfg.child_setup != NULL) {
+            GgError child_err = cfg.child_setup(cfg.child_setup_ctx);
+            if (child_err != GG_ERR_OK) {
+                (void) gg_file_write(
+                    err_pipe[1],
+                    (GgBuffer) { (uint8_t *) &child_err, sizeof(child_err) }
+                );
+                _Exit(1);
+            }
+        }
+
+        if (!cfg.keep_fds) {
+            ggl_close_fds_from(3);
+        }
 
         execvp(argv[0], (char **) argv);
 
+        GG_LOGE("Err %d when calling execve.", errno);
+        GgError child_err = GG_ERR_FAILURE;
+        (void) gg_file_write(
+            err_pipe[1],
+            (GgBuffer) { (uint8_t *) &child_err, sizeof(child_err) }
+        );
         _Exit(1);
     }
 
+    (void) gg_close(err_pipe[1]);
+
     if (pid < 0) {
         GG_LOGE("Err %d when calling fork.", errno);
-        return GG_ERR_FAILURE;
+        return GG_ERR_FATAL;
     }
 
-    *handle = pid;
+    GgError child_err;
+    GgBuffer err_buf = { (uint8_t *) &child_err, sizeof(child_err) };
+    GgError ret = gg_file_read(err_pipe[0], &err_buf);
+    if (ret != GG_ERR_OK) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        return ret;
+    }
+
+    if (err_buf.len != 0) {
+        assert(err_buf.len == sizeof(child_err));
+        // Child failed before exec; reap it.
+        waitpid(pid, NULL, 0);
+        return child_err;
+    }
+
+    *handle = (GglProcessHandle) { .val = pid };
     return GG_ERR_OK;
 }
 
-GgError ggl_process_wait(int handle, bool *exit_status) {
+GgError ggl_process_wait(GglProcessHandle handle, bool *exit_status) {
     while (true) {
         siginfo_t info = { 0 };
-        int ret = waitid(P_PID, (id_t) handle, &info, WEXITED);
+        int ret = waitid(P_PID, (id_t) handle.val, &info, WEXITED);
         if (ret < 0) {
             if (errno == EINTR) {
                 continue;
             }
             GG_LOGE("Err %d when calling waitid.", errno);
-            return GG_ERR_FAILURE;
+            return GG_ERR_FATAL;
         }
 
         switch (info.si_code) {
@@ -112,9 +175,9 @@ GgError ggl_process_wait(int handle, bool *exit_status) {
     }
 }
 
-GgError ggl_process_kill(int handle, uint32_t term_timeout) {
+GgError ggl_process_kill(GglProcessHandle handle, uint32_t term_timeout) {
     if (term_timeout == 0) {
-        kill(handle, SIGKILL);
+        kill(handle.val, SIGKILL);
         return ggl_process_wait(handle, NULL);
     }
 
@@ -124,7 +187,7 @@ GgError ggl_process_kill(int handle, uint32_t term_timeout) {
 
     sigset_t old_set;
 
-    kill(handle, SIGTERM);
+    kill(handle.val, SIGTERM);
 
     // Prevent multiple threads from unblocking SIGALRM
     static pthread_mutex_t sigalrm_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -140,7 +203,7 @@ GgError ggl_process_kill(int handle, uint32_t term_timeout) {
         alarm(term_timeout);
 
         siginfo_t info = { 0 };
-        waitid_ret = waitid(P_PID, (id_t) handle, &info, WEXITED);
+        waitid_ret = waitid(P_PID, (id_t) handle.val, &info, WEXITED);
         waitid_err = errno;
 
         alarm(0);
@@ -154,17 +217,17 @@ GgError ggl_process_kill(int handle, uint32_t term_timeout) {
 
     if (waitid_err != EINTR) {
         GG_LOGE("Err %d when calling waitid.", waitid_err);
-        return GG_ERR_FAILURE;
+        return GG_ERR_FATAL;
     }
 
-    kill(handle, SIGKILL);
+    kill(handle.val, SIGKILL);
 
     return ggl_process_wait(handle, NULL);
 }
 
 GgError ggl_process_call(const char *const argv[]) {
-    int handle;
-    GgError ret = ggl_process_spawn(argv, &handle);
+    GglProcessHandle handle = { 0 };
+    GgError ret = ggl_process_spawn(argv, NULL, &handle);
     if (ret != GG_ERR_OK) {
         return ret;
     }
